@@ -236,25 +236,36 @@ async function saveResultDB(matchId, result) {
 
 // ─── TIPS ───────────────────────────────────────────────────────────────────
 
-async function getMyTip(matchId) {
-  const ref = doc(db, 'tips', `${currentUser.toLowerCase()}_${matchId}`);
-  const snap = await getDoc(ref);
-  return snap.exists() ? snap.data() : null;
+let tipsCache = {}; // matchId -> { userName -> tipData }
+
+async function loadAllTips() {
+  const snap = await getDocs(collection(db, 'tips'));
+  tipsCache = {};
+  snap.forEach(d => {
+    const t = d.data();
+    if (!tipsCache[t.matchId]) tipsCache[t.matchId] = {};
+    tipsCache[t.matchId][t.user?.toLowerCase()] = t;
+  });
+}
+function getMyTipCached(matchId) {
+  return tipsCache[matchId]?.[currentUser.toLowerCase()] || null;
+}
+function getAllTipsForMatchCached(matchId) {
+  return Object.values(tipsCache[matchId] || {});
 }
 async function saveTipDB(matchId, tip) {
   const id = `${currentUser.toLowerCase()}_${matchId}`;
-  await setDoc(doc(db, 'tips', id), { ...tip, user: currentUser, matchId, updatedAt: Date.now() });
-}
-async function getAllTipsForMatch(matchId) {
-  const snap = await getDocs(collection(db, 'tips'));
-  const tips = [];
-  snap.forEach(d => { if (d.data().matchId === matchId) tips.push(d.data()); });
-  return tips;
+  const data = { ...tip, user: currentUser, matchId, updatedAt: Date.now() };
+  await setDoc(doc(db, 'tips', id), data);
+  if (!tipsCache[matchId]) tipsCache[matchId] = {};
+  tipsCache[matchId][currentUser.toLowerCase()] = data;
 }
 async function getAllTipsForUser(userName) {
-  const snap = await getDocs(collection(db, 'tips'));
   const tips = {};
-  snap.forEach(d => { if (d.data().user?.toLowerCase() === userName.toLowerCase()) tips[d.data().matchId] = d.data(); });
+  for (const matchId of Object.keys(tipsCache)) {
+    const t = tipsCache[matchId][userName.toLowerCase()];
+    if (t) tips[matchId] = t;
+  }
   return tips;
 }
 
@@ -321,9 +332,11 @@ function doAdminLogin() {
 function renderApp() {
   const tabs = isAdmin
     ? `<button class="tab active" onclick="switchTab('tips',this)">🏒 Tipy</button>
+       <button class="tab" onclick="switchTab('prehled',this)">👀 Prehľad</button>
        <button class="tab" onclick="switchTab('admin',this)">⚙️ Admin</button>
        <button class="tab" onclick="switchTab('leaderboard',this)">🏆 Rebríček</button>`
     : `<button class="tab active" onclick="switchTab('tips',this)">🏒 Moje tipy</button>
+       <button class="tab" onclick="switchTab('prehled',this)">👀 Prehľad</button>
        <button class="tab" onclick="switchTab('leaderboard',this)">🏆 Rebríček</button>`;
 
   root().innerHTML = `
@@ -340,6 +353,7 @@ function renderApp() {
   </div>
   <div class="tabs">${tabs}</div>
   <div id="tab-tips" class="section active"><div class="loading"><div class="spinner"></div>Načítavam...</div></div>
+  <div id="tab-prehled" class="section"></div>
   ${isAdmin ? '<div id="tab-admin" class="section"></div>' : ''}
   <div id="tab-leaderboard" class="section"></div>`;
 
@@ -355,6 +369,7 @@ function switchTab(name, btn) {
 }
 function loadSection(name) {
   if (name === 'tips') renderTips();
+  if (name === 'prehled') renderPrehled();
   if (name === 'admin') renderAdmin();
   if (name === 'leaderboard') renderLeaderboard();
 }
@@ -362,20 +377,47 @@ function logout() { currentUser = null; isAdmin = false; renderLogin(); }
 
 // ─── TIPS SECTION ────────────────────────────────────────────────────────────
 
+let showPlayed = false;
+
 async function renderTips() {
   const el = document.getElementById('tab-tips');
   if (!el) return;
-  const matches = await getMatches();
+  el.innerHTML = '<div class="loading"><div class="spinner"></div>Načítavam...</div>';
+
+  // Načítaj všetko naraz — 2 requesty namiesto 100+
+  const [matches] = await Promise.all([getMatches(), loadAllTips()]);
+
   if (!matches.length) {
     el.innerHTML = '<div class="card"><div class="empty"><div class="empty-icon">📅</div>Admin ešte nepridali zápasy. Skús neskôr.</div></div>';
     return;
   }
+
+  const upcoming = matches.filter(m => !isLocked(m));
+  const played = matches.filter(m => isLocked(m));
+
   let html = '';
-  for (const m of matches) {
+
+  // Prepínač odohrané
+  if (played.length) {
+    html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <span style="font-size:13px;color:var(--text-muted)">${upcoming.length} nadchádzajúcich · ${played.length} odohraných</span>
+      <button class="btn btn-secondary btn-small" onclick="togglePlayed()">${showPlayed ? '🙈 Schovať odohrané' : '📋 Zobraziť odohrané'}</button>
+    </div>`;
+  }
+
+  const toShow = showPlayed ? matches : upcoming.length ? upcoming : matches;
+
+  if (!toShow.length) {
+    html += '<div class="card"><div class="empty">Žiadne nadchádzajúce zápasy.<br><br><button class="btn btn-secondary btn-small" onclick="togglePlayed()">Zobraziť odohrané</button></div></div>';
+    el.innerHTML = html;
+    return;
+  }
+
+  for (const m of toShow) {
     const sk = isSK(m);
     const locked = isLocked(m);
-    const myTip = await getMyTip(m.id);
-    const otherTips = isAdmin ? await getAllTipsForMatch(m.id) : [];
+    const myTip = getMyTipCached(m.id);
+    const otherTips = isAdmin ? getAllTipsForMatchCached(m.id) : [];
 
     html += `<div class="card"><div class="match-header">
       <div>
@@ -457,6 +499,31 @@ async function renderTips() {
         }
         html += `</div>`;
       }
+
+      // Admin manual tip entry
+      const usersForTip = await (async () => { const s = await getDocs(collection(db, 'users')); const r = []; s.forEach(d => r.push(d.data().name)); return r; })();
+      if (usersForTip.length) {
+        html += `<div class="divider"></div>
+        <div class="card-title">📝 Zadať tip za hráča (admin)</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:8px">
+          <div><label>Hráč</label>
+            <select id="at-user-${m.id}" style="width:130px">
+              ${usersForTip.map(u => `<option value="${u}">${u}</option>`).join('')}
+            </select>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:18px">
+            <input class="score-input" type="number" min="0" max="20" placeholder="0" id="at-h-${m.id}" style="width:52px" />
+            <span class="score-sep">:</span>
+            <input class="score-input" type="number" min="0" max="20" placeholder="0" id="at-a-${m.id}" style="width:52px" />
+          </div>
+        </div>
+        <div class="winner-row">
+          <button class="wbtn" id="at-wh-${m.id}" onclick="selAT('${m.id}','${m.home.replace(/'/g,"\\'")}',this)">${m.home}</button>
+          <button class="wbtn" id="at-wa-${m.id}" onclick="selAT('${m.id}','${m.away.replace(/'/g,"\\'")}',this)">${m.away}</button>
+        </div>
+        <button class="btn btn-secondary btn-small" style="margin-top:10px" onclick="doAdminTip('${m.id}')">Uložiť tip za hráča</button>
+        <div id="at-msg-${m.id}"></div>`;
+      }
     }
 
     html += `</div>`;
@@ -464,6 +531,33 @@ async function renderTips() {
   el.innerHTML = html;
 }
 
+window.togglePlayed = function() {
+  showPlayed = !showPlayed;
+  renderTips();
+};
+
+
+window.selAT = function(matchId, winner, btn) {
+  const hb = document.getElementById('at-wh-' + matchId);
+  const ab = document.getElementById('at-wa-' + matchId);
+  if (!hb || !ab) return;
+  hb.classList.remove('sel'); ab.classList.remove('sel');
+  btn.classList.add('sel');
+};
+window.doAdminTip = async function(matchId) {
+  const userName = document.getElementById('at-user-' + matchId)?.value;
+  const h = parseInt(document.getElementById('at-h-' + matchId)?.value) || 0;
+  const a = parseInt(document.getElementById('at-a-' + matchId)?.value) || 0;
+  const hb = document.getElementById('at-wh-' + matchId);
+  const ab = document.getElementById('at-wa-' + matchId);
+  const winner = hb?.classList.contains('sel') ? hb.textContent.trim() : (ab?.classList.contains('sel') ? ab.textContent.trim() : '');
+  if (!winner) { msg('at-msg-' + matchId, 'Vyber víťaza.', 'err'); return; }
+  if (!userName) { msg('at-msg-' + matchId, 'Vyber hráča.', 'err'); return; }
+  const id = `${userName.toLowerCase()}_${matchId}`;
+  await setDoc(doc(db, 'tips', id), { home: h, away: a, winner, user: userName, matchId, updatedAt: Date.now(), adminEntry: true });
+  msg('at-msg-' + matchId, `✓ Tip za ${userName} uložený.`, 'ok');
+  setTimeout(() => renderTips(), 1200);
+};
 window.selW = function(matchId, winner, other, btn) {
   const hb = document.getElementById('wb-h-' + matchId);
   const ab = document.getElementById('wb-a-' + matchId);
@@ -502,6 +596,80 @@ window.doSaveResult = async function(matchId) {
   setTimeout(() => renderTips(), 1200);
 };
 
+// ─── PREHĽAD TIPOV ───────────────────────────────────────────────────────────
+
+async function renderPrehled() {
+  const el = document.getElementById('tab-prehled');
+  if (!el) return;
+  el.innerHTML = '<div class="loading"><div class="spinner"></div>Načítavam...</div>';
+
+  const [matches] = await Promise.all([getMatches(), loadAllTips()]);
+  const usersSnap = await getDocs(collection(db, 'users'));
+  const users = [];
+  usersSnap.forEach(d => users.push(d.data().name));
+
+  const lockedMatches = matches.filter(m => isLocked(m));
+
+  if (!lockedMatches.length) {
+    el.innerHTML = '<div class="card"><div class="empty"><div class="empty-icon">⏳</div>Zatiaľ žiadne začaté ani odohrané zápasy.</div></div>';
+    return;
+  }
+
+  let html = `<div style="font-size:13px;color:var(--text-muted);margin-bottom:12px">Tipy všetkých hráčov na začaté/odohrané zápasy (${lockedMatches.length})</div>`;
+
+  for (const m of lockedMatches) {
+    const sk = isSK(m);
+    const hasResult = !!m.result?.winner;
+
+    html += `<div class="card" style="overflow-x:auto">
+      <div class="match-header">
+        <div>
+          <div class="match-teams">${m.home} – ${m.away}
+            ${sk ? '<span class="badge badge-sk">🇸🇰 SK</span>' : ''}
+            ${hasResult ? '<span class="badge badge-locked">✓ výsledok</span>' : '<span class="badge" style="background:#FEF5E0;color:#7C5A0A">▶ prebieha</span>'}
+          </div>
+          <div class="match-meta">${m.kickoff ? '⏰ ' + fmtTime(m.kickoff) : ''}${m.group ? ' · Skupina ' + m.group : ''}</div>
+          ${hasResult ? `<div style="margin-top:4px;font-size:13px;font-weight:600">Výsledok: ${m.result.home} : ${m.result.away} <span style="font-weight:400;color:var(--text-muted)">(${m.result.winner})</span></div>` : ''}
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:13px">
+        <thead>
+          <tr style="border-bottom:2px solid var(--border)">
+            <th style="text-align:left;padding:4px 8px 6px 0;color:var(--text-muted);font-weight:500">Hráč</th>
+            <th style="text-align:center;padding:4px 6px 6px;color:var(--text-muted);font-weight:500">Tip</th>
+            <th style="text-align:center;padding:4px 6px 6px;color:var(--text-muted);font-weight:500">Víťaz</th>
+            <th style="text-align:center;padding:4px 0 6px 6px;color:var(--text-muted);font-weight:500">Body</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${users.map(userName => {
+            const tip = tipsCache[m.id]?.[userName.toLowerCase()];
+            const pts = hasResult ? calcPts(tip, m.result, sk) : null;
+            const isMe = userName.toLowerCase() === currentUser.toLowerCase();
+            const rowStyle = isMe ? 'background:var(--blue-bg);' : '';
+            if (!tip) return `<tr style="${rowStyle}border-bottom:1px solid var(--border)">
+              <td style="padding:6px 8px 6px 0;font-weight:${isMe?'600':'400'}">${userName}${isMe?' 👤':''}</td>
+              <td style="text-align:center;color:var(--text-hint);padding:6px">—</td>
+              <td style="text-align:center;color:var(--text-hint);padding:6px">—</td>
+              <td style="text-align:center;padding:6px">${hasResult ? '<span class="badge badge-zero">0 b</span>' : ''}</td>
+            </tr>`;
+            const winnerShort = tip.winner === m.home ? m.home : tip.winner === m.away ? m.away : '?';
+            const correct = hasResult && tip.winner === m.result.winner;
+            return `<tr style="${rowStyle}border-bottom:1px solid var(--border)">
+              <td style="padding:6px 8px 6px 0;font-weight:${isMe?'600':'400'}">${userName}${isMe?' 👤':''}</td>
+              <td style="text-align:center;font-weight:500;padding:6px">${tip.home} : ${tip.away}</td>
+              <td style="text-align:center;padding:6px;color:${correct?'var(--green)':'var(--text-muted)'};font-weight:${correct?'600':'400'}">${winnerShort}</td>
+              <td style="text-align:center;padding:6px">${pts !== null ? ptsBadge(pts) : ''}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
 // ─── ADMIN SECTION ───────────────────────────────────────────────────────────
 
 async function renderAdmin() {
@@ -535,7 +703,24 @@ async function renderAdmin() {
   </div>
   <div class="card">
     <div class="card-title">Registrovaní hráči (${users.length})</div>
-    ${users.map(u => `<div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;padding:5px 0;border-bottom:1px solid var(--border)"><span>${u.name}</span><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--text-hint)">${fmtTime(u.createdAt)}</span><button class="btn btn-danger" onclick="doDeleteUser('${u.name}')">Odstrániť</button></div></div>`).join('') || '<div class="empty">Nikto sa ešte nezaregistroval.</div>'}
+    ${users.map(u => `
+    <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px">
+        <span style="font-weight:500">${u.name}</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="color:var(--text-hint);font-size:11px">${fmtTime(u.createdAt)}</span>
+          <button class="btn btn-secondary btn-small" onclick="togglePinChange('${u.name}')">🔑 PIN</button>
+          <button class="btn btn-danger" onclick="doDeleteUser('${u.name}')">Odstrániť</button>
+        </div>
+      </div>
+      <div id="pin-change-${u.name.toLowerCase().replace(/\s/g,'_')}" style="display:none;margin-top:8px;display:none">
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <div style="flex:1"><label>Nový PIN</label><input type="password" id="new-pin-${u.name.toLowerCase().replace(/\s/g,'_')}" placeholder="4–6 číslic" maxlength="6" /></div>
+          <button class="btn btn-primary btn-small" onclick="doChangePin('${u.name}')">Uložiť</button>
+        </div>
+        <div id="pin-msg-${u.name.toLowerCase().replace(/\s/g,'_')}"></div>
+      </div>
+    </div>`).join('') || '<div class="empty">Nikto sa ešte nezaregistroval.</div>'}
   </div>`;
 }
 
@@ -563,6 +748,24 @@ window.doDeleteUser = async function(name) {
   tipsSnap.forEach(d => { if (d.data().user?.toLowerCase() === name.toLowerCase()) toDelete.push(d.id); });
   for (const id of toDelete) await deleteDoc(doc(db, 'tips', id));
   renderAdmin();
+};
+window.togglePinChange = function(name) {
+  const key = name.toLowerCase().replace(/\s/g, '_');
+  const el = document.getElementById('pin-change-' + key);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+};
+window.doChangePin = async function(name) {
+  const key = name.toLowerCase().replace(/\s/g, '_');
+  const newPin = document.getElementById('new-pin-' + key)?.value.trim();
+  const msgEl = document.getElementById('pin-msg-' + key);
+  if (!newPin || newPin.length < 4) {
+    if (msgEl) msgEl.innerHTML = '<div class="msg msg-err">PIN musí mať aspoň 4 číslice.</div>';
+    return;
+  }
+  await setDoc(doc(db, 'users', name.toLowerCase()), { pin: newPin }, { merge: true });
+  if (msgEl) msgEl.innerHTML = '<div class="msg msg-ok">✓ PIN zmenený.</div>';
+  setTimeout(() => { if (msgEl) msgEl.innerHTML = ''; }, 3000);
 };
 window.doLogin = doLogin;
 window.doRegister = doRegister;

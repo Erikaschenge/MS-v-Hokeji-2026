@@ -556,7 +556,8 @@ window.doAdminTip = async function(matchId) {
   const id = `${userName.toLowerCase()}_${matchId}`;
   await setDoc(doc(db, 'tips', id), { home: h, away: a, winner, user: userName, matchId, updatedAt: Date.now(), adminEntry: true });
   msg('at-msg-' + matchId, `✓ Tip za ${userName} uložený.`, 'ok');
-  setTimeout(() => renderTips(), 1200);
+  const scrollY = window.scrollY;
+  setTimeout(async () => { await renderTips(); window.scrollTo({ top: scrollY, behavior: 'instant' }); }, 1200);
 };
 window.selW = function(matchId, winner, other, btn) {
   const hb = document.getElementById('wb-h-' + matchId);
@@ -593,7 +594,8 @@ window.doSaveResult = async function(matchId) {
   if (!winner || isNaN(h) || isNaN(a)) { msg('res-msg-' + matchId, 'Zadaj výsledok aj víťaza.', 'err'); return; }
   await saveResultDB(matchId, { home: h, away: a, winner, savedAt: Date.now() });
   msg('res-msg-' + matchId, '✓ Výsledok uložený.', 'ok');
-  setTimeout(() => renderTips(), 1200);
+  const scrollY = window.scrollY;
+  setTimeout(async () => { await renderTips(); window.scrollTo({ top: scrollY, behavior: 'instant' }); }, 1200);
 };
 
 // ─── PREHĽAD TIPOV ───────────────────────────────────────────────────────────
